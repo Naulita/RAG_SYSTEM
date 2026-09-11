@@ -209,7 +209,7 @@ class AdvancedRAGEngine:
 
     def chunk_documents(self, documents: List[Document]) -> List[Document]:
           text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size = self.config.chunk_size
+                chunk_size = self.config.chunk_size,
                 chunk_overlap = self.chunk_overlap, 
                 length_function = len,
                 separators = ["\n\n", "\n", ". ", " ", ""],
@@ -270,7 +270,7 @@ class AdvancedRAGEngine:
                 self.vector_store.add_documents(chunks)
                 self._indexed_chunks.extend(chunks)
 
-          if self.config.enable_hybrid_search;
+          if self.config.enable_hybrid_search:
                 self.build_bm25_retriever(self._indexed_chunks)
                 self.build_ensemble_retriever()
 

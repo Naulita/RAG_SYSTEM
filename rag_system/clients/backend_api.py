@@ -10,7 +10,6 @@ from tenacity import (
     wait_exponential,
 )
 
-
 from rag_system.config import AppSettings
 
 try:
@@ -67,4 +66,107 @@ class BackendApiClient:
         except Exception as exc:
             logger.warning("Backend API ping failded: {}", exc)
             return False
+
+    @retry(
+        stop = stop_after_attempt(3),
+        wait=wait_exponential(multiplier=0.5, min=0.5, max=3),
+        retry=retry_if_exception_type(requests.RequestException),
+        reraise=True,
+    )
+    def download_documents_zip(self) -> bytes:
+        url = f"{self._settings.api_base_url.rstrip('/')}/api/documents/download"
+        response = self._settings.get(url, timeout= self._settings.api_timeout_seconds)
+        response.raise_for_status()
+        return response.content
+
+
+    def team_profile(self, name:str) -> Dict[str, Any] | None:
+        result = self._safe_get("/api/team", {"name":name})
+        return result if isinstance(result, dict) else None
+
+    def team_insights(self, name: str) -> List[Dict[str,Any]] | None:
+        result = self._safe_get("/api/team/insights", {"name":name})
+        if isinstance (result, list):
+            return [item for item in result if isinstance(item,dict)]
+        return None
+
+    def investment_profile(self, company_name: str) -> Dict[str, Any] | None:
+        result = self._safe_get("/api/investments", {"company_name": company_name})
+        return result if isinstance(result,dict) else None
+
+    def investment_insights(self, company_name: str) -> List[Dict[str, Any]] | None:
+        result = self._safe_get(
+            "/api/investments/insights", {"company_name":company_name}
+        )
+
+        if isinstance(result,list):
+            return [item for item in result if isinstance(item,dict)]
+        return None
+
+    def sector_profile(self, sector: str) -> Dict[str, Any] | None:
+        result = self._safe_get("/api/sectors",{"sector":sector})
+        return result if isinstance(result, dict) else None
+
+    def consultations(self, name:str) -> List[Dict[str, Any]] | None:
+        result = self._safe_get("/api/consultations", {"name":name})
+        if isinstance(result, list):
+            return [item for item in result if isinstance(item,dict)]
+        return None
+
+    def scrape_page(self, url:str) -> Dict[str, Any] | None:
+        result = self._safe_get("/api,scrape",{"url":url})
+        return result if isinstance(result,dict) else None
+
+    def run_tool(self, tool: str, **kwargs: Any) -> Any:
+        tools = self.available_tools()
+
+        handler = tools.get(tool)
+        if handler is None:
+            raise ValueError(f"Unsupported backend tool: {tool}")
+
+        return handler(**kwargs)
+
+    def fetch_entity_data(self, entities: Dict[str, List[str]]) -> Dict[str,Any]:
+        """Legacy convenience method kept for compatibility"""
+        api_data: Dict[str, Any] = {}
+
+
+        for person in entities.get("persons",[][:2]):
+            profile = self.team_profile(person)
+            if profile is not None:
+                api_data[f"team_profile:{person}"] = profile
+
+
+        for company in entities.get("companies", [])[:2]:
+            investment = self.investment_profile(company)
+            if investment is not None:
+                api_data[f"investment_profile:{company}"] = investment
+
+        for sector in entities.get("sectors", [])[:2]:
+            info = self.sector_profile(sector)
+            if info is not None:
+                api_data[f"sector_profile:{sector}"] = info
+
+
+        return api_data
+
+    def available_tools(self) -> Dict[str, Any]:
+        return {
+            "team_profile" : self.team_profile,
+              "team_insights": self.team_insights,
+            "investment_profile": self.investment_profile,
+            "investment_insights": self.investment_insights,
+            "sector_profile": self.sector_profile,
+            "consultations": self.consultations,
+            "scrape_page": self.scrape_page,
+        }
+
+    def tool_names(self) -> List[str]:
+        return sorted(self.available_tools().keys())
+
+
+
+    
+
+    
     
