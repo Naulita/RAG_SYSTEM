@@ -423,12 +423,353 @@ class AdvancedRAGEngine:
                    all_docs.append(doc)
 
          return all_docs[: self.config.top_k *2]
-    
-    
+
+
+    def _decompose_retrieval (self, query: str) -> List[Document]:
+         all_docs: List[Document] = []
+         seen = set()
+
+         for q in self.decompose_query(query):
+              for doc in self._hybrid_retrieval(q):
+                   key = hash(doc.page_content)
+                   if key in seen:
+                        continue
+                   seen.add(key)
+                   all_docs.append(doc)
+
+         return all_docs[:self.config.top_k *2]
+
+    def _rerank_documents(
+              self, query: str, documents: List[Document]
+              ) -> Tuple[List[Document], List[float]]:
+         if not self.reranker or not documents:
+              return documents, [1.0]* len(documents)
+
+
+         pairs = [[query, doc.page_content] for doc in documents]
+         scores = self.reranker.predict(pairs)
+
+         ranked = sorted(zip(documents, scores), key=lambda item:item[1], reverse= True)
+         docs = [doc for doc, _ in ranked][: self.config.top_k]
+         out_scores = [float(score) for _, score in ranked][: self.config.top_k]
+
+         return docs, out_scores
+
+    def extract_entities(self, text: str) -> Dict[str, List[str]]:
+         entities: Dict[str, List[str]] = {
+              "persons": [],
+              "companies": [],
+              "sectors": [],
+              "urls": [],
+         }
+
+
+         persons = re.findall(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b", text)
+         person_blacklist = {
+            "Peakspan Masterclasses",
+            "Peakspan Masterclass",
+            "User Query",
+            "Document Context",
+         }
+
+         entities["persons"] = [
+              person for person in sorted(set(persons)) if person not in person_blacklist
+         ]
+
+         companies = re.findall(
+            r"\b([A-Z][a-zA-Z0-9&]+(?:\s+[A-Z][a-zA-Z0-9&]+){0,2})\b", text
+        )
+
+         company_blacklist = {
+            "What",
+            "Tell",
+            "How",
+            "PeakSpan",
+            "MasterClass",
+            "MasterClasses",
+            "Document",
+            "Source",
+            "Query",
+            "Response",
+        }
+
+         entities["companies"] = [
+              item for item in sorted(set(companies)) if item not in company_blacklist
+         ]
+
+         entities["urls"] = re.findall(r"https?://[^\s]+", text)
+
+         sector_keywords = [
+            "technology",
+            "healthcare",
+            "finance",
+            "saas",
+            "software",
+            "fintech",
+            "security",
+            "enterprise",
+            "education",
+            "consumer",
+        ]
+         lower = text.lower()
+         entities["sectors"] = [
+            keyword for keyword in sector_keywords if keyword in lower
+        ]
+
+         return entities
+
+    def call_api_chain(
+              self,
+              query: str,
+              entities: Dict[str, List[str]],
+              retrieval_context: str ="",
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+         if not self.backend_client or not self.api_orchestrator:
+              return {},[]
+
+         llm_seed_calls = self._plan_tool_calls_with_llm(
+              query = query, entities = entities, retrieval_context = retrieval_context
+         )
+
+         return self.api_orchestrator.execute(
+              query = query,
+              entities = entities,
+              retrieval_context = retrieval_context,
+              seed_calls = llm_seed_calls
+         )
+
+    def _plan_tool_calls_with_llm(
+              self,
+              query: str,
+              entities: Dict[str, List[str]],
+              retrieval_context: str,
+    ) -> List[Dict[str, Any]]:
+         if not self.backend_client:
+              return []
+
+         tools = self.backend_client.tool_names()
+         if not tools:
+              return []
+
+         prompt = PromptTemplate(
+              template=(
+                  "You are a planning agent for tool calling.\\n"
+                "Available tools: {tools}\\n"
+                "Query: {query}\\n"
+                "Entities: {entities}\\n"
+                "Retrieved Context Snippet: {retrieval_context}\\n\\n"
+                "Return ONLY a JSON array of tool calls with this schema:\\n"
+                '[{"tool": "team_profile", "params": {"name": "..."}, "reason": "..."}]\\n'
+                "Rules:\\n"
+                "1) Use only available tools.\\n"
+                "2) At most 6 calls.\\n"
+                "3) Params must match tool signatures.\\n"
+                "4) If no call needed, return []"
+            ),
+            input_variables=["tools", "query","entities", "retrieval_context"],
+         )
+
+         try: 
+              chain = LLMChain(llm=self.llm, prompt=prompt)
+              raw_output = self._chain_invoke_text(
+                   chain,
+                   {
+                        "tools": ",".join(tools),
+                        "query": query,
+                        "entities": json.dumps(entities),
+                        "retrieval_context": retrieval_context[:1200],
+                   },
+              )
+              return self._parse_tools_calls_json(raw_output)
+
+         except Exception as exc:
+              logger.debug("LLM tool planing failed: {}", exc)
+              return []
+
+    @staticmethod
+    def _parse_tool_calls_json(raw_output:str) -> List[Dict[str, Any]]:
+              text = raw_output.strip()
+              if not text:
+                   return []
+
+              start = text.find("[")
+              end = text.find("]")
+
+              if start != -1 and end !=-1 and end > start:
+                   text = text[start:end+1]
+
+              try: 
+                   parsed = json.loads(text)
+                   if not isinstance(parsed,list):
+                        return []
+                   cleaned: List[Dict[str,Any]]=[]
+                   for item in parsed:
+                        if not isinstance(item, dict):
+                             continue
+                        if "tool" not in item:
+                             continue
+
+                        params = (
+                             item.get("params") if isinstance(item.get("params"), dict) else {}
+                        )
+
+                        cleaned.append(
+                        {"tool": str(item["tool"]).strip(),
+                        "params": params,
+                        "reason": str(item.get("reason", "llm-planned")),}
+                        )
+
+                   return cleaned[:6]
+              except Exception:
+                  return []
+
+    def generate_response(
+              self,
+              query: str,
+              retrieval_result: RetrievalResult,
+              api_data: Dict[str, Any],
+              api_trace: Optional[List[Dict[str, Any]]] = None,
+      ) -> str:
+         context_parts = []
+         for index, (doc,score) in enumerate(
+              zip(retrieval_result.documents, retrieval_result.scores), start= 1
+         ):
+              context_parts.append(
+                   f"[Document {index}] (Relevance: {score: .2f})\n"
+                   f"Source: {doc.metadata.get('source', 'Unknown')}\n"
+                   f"{doc.page_content}\n"
+
+              )
+
+         context = "\n---\n".join(context_parts)
+         history = self.memory.load_memory_variables({}).get(self.config.memory_key, "")
+
+         api_summary=""
+         if api_data:
+              api_summary = "External Data:\n" + "\n".join(
+                f"- {key}: {str(value)[:200]}..." for key, value in api_data.items()
+            )
+
+         api_trace_summary = ""
+         if api_trace:
+              api_trace_summary = "API Chain Trace:\n" + "\n".join(
+                f"- {item.get('tool')}({item.get('params')}) => {item.get('status')}"
+                for item in api_trace[:12]
+            )
+
+         template = """You are an intelligent assistant with access to document context and external API data.
+
+                  Conversation History:
+                  {history}
+
+                  Document Context:
+                  {context}
+
+                  {api_summary}
+                  {api_trace_summary}
+
+                  User Query: {query}
+
+                  Instructions:
+                  1. Use the provided evidence.
+                  2. Cite documents as [Document X] when relevant.
+                  3. If information is unavailable, explicitly say so.
+                  4. Keep the answer concise and useful.
+
+                  Response:"""
+         prompt = PromptTemplate(
+            template=template,
+            input_variables=[
+                "history",
+                "context",
+                "api_summary",
+                "api_trace_summary",
+                "query",
+            ],
+         )
+
+         chain = LLMChain(llm=self.llm, prompt=prompt)
+
+         try:
+              response = self._chain_invoke_text(
+                    chain,
+                {
+                    "history": str(history),
+                    "context": context,
+                    "api_summary": api_summary,
+                    "api_trace_summary": api_trace_summary,
+                    "query": query,
+                },   
+              )
+
+              self.memory.save_context({"input": query}, {"output": response})
+              return response
+         except Exception as exc:
+              logger.error("Error generating LLM response: {}", exc)
+              return "I apologize, but I encountered an error generating a response. Please try again."
+
+    @staticmethod
+    def _chain_invoke_text(chain: LLMChain, payload: Dict[str, Any]) -> str:
+         output = chain.invoke(payload)
+         if isinstance(output,str):
+              return output
+         if isinstance(output,dict):
+              for key in ("text", "output", "response"):
+                value = output.get(key)
+                if isinstance(value, str):
+                    return value
+              values = [value for value in output.values() if isinstance(value, str)]
+              if values:
+                   return values[0]
+         return str(output)
+
+
+    def query(
+              self,
+              query: str,
+              strategy: RetrievalStrategy = RetrievalStrategy.HYBRID,
+              use_api_chain: bool = True,
+    ) -> Dict[str, Any]:
+         retrieval_result = self.retrieve_documents(query,strategy)
+
+         api_data: Dict[str, Any] = {}
+         api_trace: List[Dict[str, Any]] = []
+         if use_api_chain:
+              evidence = " ".join(
+                   doc.page_content for doc in retrieval_result.documents[:2]
+              )
+              entities = self.extract_entities(f"{query} {evidence}")
+              api_data, api_trace = self.call_api_chain(
+                   query=query,
+                   entities=entities,
+                   retrieval_context=evidence,
+              )
+
+         response = self.generate_response(
+              query, retrieval_result, api_data, api_trace=api_trace
+         )
+
+         return {
+             "query": query,
+            "response": response,
+            "strategy": strategy.value,
+            "num_documents": len(retrieval_result.documents),
+            "sources": [
+                {
+                    "source": doc.metadata.get("source", "Unknown"),
+                    "score": float(score),
+                    "preview": f"{doc.page_content[:200]}...",
+                }
+                for doc, score in zip(
+                    retrieval_result.documents, retrieval_result.scores
+                )
+            ],
+            "api_data_keys": list(api_data.keys()),
+            "api_chain_trace": api_trace,
+        } 
+         
+
+         
+              
 
     
-
-                      
-                   
-
-        
