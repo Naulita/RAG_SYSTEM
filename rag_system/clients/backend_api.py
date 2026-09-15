@@ -163,10 +163,3 @@ class BackendApiClient:
 
     def tool_names(self) -> List[str]:
         return sorted(self.available_tools().keys())
-
-
-
-    
-
-    
-    
