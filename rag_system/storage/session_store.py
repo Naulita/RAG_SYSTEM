@@ -32,7 +32,7 @@ class InMemorySessionStore:
                 "messages": [],
             }
 
-            return {"session:id":session_id, **self._sessions[session_id]}
+            return {"session_id":session_id, **self._sessions[session_id]}
         
     def get_session(self, session_id:str) -> Optional[Dict[str, Any]]:
 

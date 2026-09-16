@@ -257,7 +257,7 @@ class AgenticApiOrchestrator:
                      if isinstance(sectors,str) and sector.strip():
                          follow_ups.append(
                              PlannedToolCall(
-                                 "tool="sector_profile",
+                                 tool="sector_profile",
                                  params={"sector":sector.strip()},
                                  reason="derived from investment sectors",
                              )
@@ -331,7 +331,7 @@ class AgenticApiOrchestrator:
      def extract_urls(text:str) -> List[str]:
          return re.findall(r"https?://[^\s]+", text)
 
-    
+
      
              
              
